@@ -1,0 +1,8 @@
+env
+google_credentials.json
+GEMINI.md
+.env
+bot_data.pickle
+__pycache__/
+temp_image.jpg
+view_data.py
