@@ -69,7 +69,12 @@ async def set_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if 'saved_sheets' not in context.user_data:
                 context.user_data['saved_sheets'] = {}
             
-            context.user_data['saved_sheets']['Main'] = sheet_id
+            # Store as dict to allow per-sheet settings (id_col, mark_col)
+            context.user_data['saved_sheets']['Main'] = {
+                'sheet_id': sheet_id,
+                'id_col': context.user_data.get('id_col'),
+                'mark_col': context.user_data.get('mark_col')
+            }
             context.user_data['sheet_id'] = sheet_id
             context.user_data['active_sheet_name'] = 'Main'
             
@@ -95,7 +100,12 @@ async def add_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if 'saved_sheets' not in context.user_data:
                 context.user_data['saved_sheets'] = {}
             
-            context.user_data['saved_sheets'][name] = sheet_id
+            # Store as dict to allow per-sheet settings (id_col, mark_col)
+            context.user_data['saved_sheets'][name] = {
+                'sheet_id': sheet_id,
+                'id_col': context.user_data.get('id_col'),
+                'mark_col': context.user_data.get('mark_col')
+            }
             
             # If no active sheet, set this one
             if 'active_sheet_name' not in context.user_data:
@@ -194,9 +204,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = data.split(":", 1)[1]
         sheets = context.user_data.get('saved_sheets', {})
         if name in sheets:
+            info = sheets[name]
+            # Migration & Extraction
+            if isinstance(info, str):
+                info = {'sheet_id': info, 'id_col': context.user_data.get('id_col'), 'mark_col': context.user_data.get('mark_col')}
+                context.user_data['saved_sheets'][name] = info
+            
             context.user_data['active_sheet_name'] = name
-            context.user_data['sheet_id'] = sheets[name]
+            context.user_data['sheet_id'] = info['sheet_id']
+            context.user_data['id_col'] = info.get('id_col')
+            context.user_data['mark_col'] = info.get('mark_col')
             context.user_data['active_worksheet'] = None
+            
             await query.edit_message_text(f"🎯 Switched to spreadsheet: **{name}**\n\nNow use `/setworksheet` to pick a tab.", parse_mode='Markdown')
             
     elif data.startswith("select_ws:"):
@@ -223,8 +242,17 @@ async def select_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sheets = context.user_data.get('saved_sheets', {})
         
         if name in sheets:
+            info = sheets[name]
+            # Migration & Extraction
+            if isinstance(info, str):
+                info = {'sheet_id': info, 'id_col': context.user_data.get('id_col'), 'mark_col': context.user_data.get('mark_col')}
+                context.user_data['saved_sheets'][name] = info
+            
             context.user_data['active_sheet_name'] = name
-            context.user_data['sheet_id'] = sheets[name]
+            context.user_data['sheet_id'] = info['sheet_id']
+            context.user_data['id_col'] = info.get('id_col')
+            context.user_data['mark_col'] = info.get('mark_col')
+            
             await update.message.reply_text(f"🎯 Switched to spreadsheet: **{name}**", parse_mode='Markdown')
         else:
             await update.message.reply_text(f"❌ Sheet '{name}' not found. Use `/listsheets` to see saved sheets.")
@@ -251,8 +279,18 @@ async def del_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     # Pick another one as active automatically
                     new_active = next(iter(context.user_data['saved_sheets']))
+                    info = context.user_data['saved_sheets'][new_active]
+                    
+                    # Migration & Extraction
+                    if isinstance(info, str):
+                        info = {'sheet_id': info, 'id_col': context.user_data.get('id_col'), 'mark_col': context.user_data.get('mark_col')}
+                        context.user_data['saved_sheets'][new_active] = info
+                    
                     context.user_data['active_sheet_name'] = new_active
-                    context.user_data['sheet_id'] = context.user_data['saved_sheets'][new_active]
+                    context.user_data['sheet_id'] = info['sheet_id']
+                    context.user_data['id_col'] = info.get('id_col')
+                    context.user_data['mark_col'] = info.get('mark_col')
+                    
                     await update.message.reply_text(f"🗑️ Sheet '{name}' removed. Active sheet is now '{new_active}'.")
                     return
             await update.message.reply_text(f"🗑️ Sheet '{name}' removed.")
@@ -270,6 +308,21 @@ async def set_id_col(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         col_num = int(context.args[0])
         context.user_data['id_col'] = col_num
+        
+        # Save to active sheet settings
+        active_name = context.user_data.get('active_sheet_name')
+        if active_name and 'saved_sheets' in context.user_data:
+            sheet_info = context.user_data['saved_sheets'].get(active_name)
+            if isinstance(sheet_info, dict):
+                sheet_info['id_col'] = col_num
+            elif isinstance(sheet_info, str):
+                # Migrate
+                context.user_data['saved_sheets'][active_name] = {
+                    'sheet_id': sheet_info,
+                    'id_col': col_num,
+                    'mark_col': context.user_data.get('mark_col')
+                }
+
         await update.message.reply_text(f"✅ IDs will now be read from column {col_num}.")
     except (IndexError, ValueError):
         await update.message.reply_text("❌ Please provide a valid number. Example: `/setidcol 2`")
@@ -283,6 +336,21 @@ async def set_mark_col(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         col_num = int(context.args[0])
         context.user_data['mark_col'] = col_num
+
+        # Save to active sheet settings
+        active_name = context.user_data.get('active_sheet_name')
+        if active_name and 'saved_sheets' in context.user_data:
+            sheet_info = context.user_data['saved_sheets'].get(active_name)
+            if isinstance(sheet_info, dict):
+                sheet_info['mark_col'] = col_num
+            elif isinstance(sheet_info, str):
+                # Migrate
+                context.user_data['saved_sheets'][active_name] = {
+                    'sheet_id': sheet_info,
+                    'id_col': context.user_data.get('id_col'),
+                    'mark_col': col_num
+                }
+
         await update.message.reply_text(f"✅ Marks will now be saved to column {col_num}.")
     except (IndexError, ValueError):
         await update.message.reply_text("❌ Please provide a valid number. Example: `/setmarkcol 4`")
@@ -454,6 +522,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             col_num = int(user_text)
             context.user_data['id_col'] = col_num
             context.user_data['state'] = None
+            
+            # Save to active sheet settings
+            active_name = context.user_data.get('active_sheet_name')
+            if active_name and 'saved_sheets' in context.user_data:
+                sheet_info = context.user_data['saved_sheets'].get(active_name)
+                if isinstance(sheet_info, dict):
+                    sheet_info['id_col'] = col_num
+                elif isinstance(sheet_info, str):
+                    context.user_data['saved_sheets'][active_name] = {
+                        'sheet_id': sheet_info,
+                        'id_col': col_num,
+                        'mark_col': context.user_data.get('mark_col')
+                    }
+
             await update.message.reply_text(f"✅ ID column set to **{col_num}**.", parse_mode='Markdown')
             return
         except ValueError:
@@ -465,6 +547,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             col_num = int(user_text)
             context.user_data['mark_col'] = col_num
             context.user_data['state'] = None
+
+            # Save to active sheet settings
+            active_name = context.user_data.get('active_sheet_name')
+            if active_name and 'saved_sheets' in context.user_data:
+                sheet_info = context.user_data['saved_sheets'].get(active_name)
+                if isinstance(sheet_info, dict):
+                    sheet_info['mark_col'] = col_num
+                elif isinstance(sheet_info, str):
+                    context.user_data['saved_sheets'][active_name] = {
+                        'sheet_id': sheet_info,
+                        'id_col': context.user_data.get('id_col'),
+                        'mark_col': col_num
+                    }
+
             await update.message.reply_text(f"✅ Mark column set to **{col_num}**.", parse_mode='Markdown')
             return
         except ValueError:
