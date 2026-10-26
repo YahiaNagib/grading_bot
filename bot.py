@@ -1,9 +1,12 @@
 import os
 import re
 import json
+from typing import Optional
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from google.cloud import vision
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
 from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler, PicklePersistence, CallbackQueryHandler
 from dotenv import load_dotenv
@@ -33,6 +36,14 @@ creds_dict = json.loads(google_creds_string)
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
+
+# --- GEMINI SETUP ---
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+if not GEMINI_API_KEY:
+    raise ValueError("Missing GEMINI_API_KEY environment variable!")
+
+GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-3.8-flash')
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Instructions for the user."""
@@ -403,20 +414,45 @@ def extract_ids_and_marks(text):
             
     return ids, marks
 
-def detect_text(image_path):
-    """Run Google Cloud Vision OCR on the image."""
-    vision_client = vision.ImageAnnotatorClient.from_service_account_info(creds_dict)
-    with open(image_path, "rb") as image_file:
-        content = image_file.read()
-    
-    image = vision.Image(content=content)
-    # Using document_text_detection handles handwriting better than standard text_detection
-    response = vision_client.document_text_detection(image=image)
-    
-    if response.error.message:
-        raise Exception(f"Vision API Error: {response.error.message}")
-        
-    return response.text_annotations[0].description if response.text_annotations else ""
+class StudentMark(BaseModel):
+    """One row read from the image. mark is None when the row has only an ID."""
+    id: str
+    mark: Optional[str] = None
+
+EXTRACTION_PROMPT = (
+    "This image is a handwritten or printed list of student IDs. "
+    "Each ID may be followed by a mark (a number, possibly with a decimal point). "
+    "Return every student ID in reading order, with its mark. "
+    "Copy the digits exactly as written. "
+    "If a row has no mark, set mark to null. "
+    "Do not invent rows or guess missing digits."
+)
+
+async def extract_pairs_from_image(image_bytes, mime_type="image/jpeg"):
+    """Ask Gemini to read student IDs and marks from the image."""
+    response = await gemini_client.aio.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[types.Part.from_bytes(data=image_bytes, mime_type=mime_type), EXTRACTION_PROMPT],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=list[StudentMark],
+            temperature=0,
+        ),
+    )
+
+    rows = response.parsed or []
+
+    pairs = []
+    for row in rows:
+        student_id = row.id.strip()
+        # Skip anything that isn't a plain number (e.g. a header Gemini picked up)
+        if not student_id.isdigit():
+            continue
+        mark = (row.mark or "").strip()
+        # Default mark is 1 when the image only has IDs
+        pairs.append((student_id, mark if mark else "1"))
+
+    return pairs
 
 def parse_and_update(text, sheet_id, id_column, mark_column, worksheet_name=None):
     """Extract IDs/Marks regardless of layout and update the sheet."""
@@ -445,7 +481,7 @@ def parse_and_update(text, sheet_id, id_column, mark_column, worksheet_name=None
         try:
             # +1 because spreadsheet index starts at 1
             row_index = existing_ids.index(student_id) + 1 
-            # Update Column B (Marks) for that specific row
+            # Write the mark into the mark column for that specific row
             sheet.update_cell(row_index, mark_column, mark) 
             results.append(f"Updated ID {student_id} with mark {mark}")
         except ValueError:
@@ -460,49 +496,25 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return 
 
     """Triggered when the bot receives a photo."""
-    await update.message.reply_text("Image received. Processing handwriting...")
+    await update.message.reply_text("Image received. Reading IDs and marks...")
     
     try:
-        # Download the highest resolution photo sent
+        # Download the highest resolution photo sent, straight into memory
         photo_file = await update.message.photo[-1].get_file()
-        image_path = "temp_image.jpg"
-        await photo_file.download_to_drive(image_path)
-        
-        # 1. Read Text
-        extracted_text = detect_text(image_path)
+        image_bytes = bytes(await photo_file.download_as_bytearray())
 
-        # await update.message.reply_text(extracted_text)
-        # 2. Parse and Update Sheets
-        # feedback = parse_and_update(extracted_text)
-        # Find every isolated group of numbers in the entire text block
-         
-        ids, marks = extract_ids_and_marks(extracted_text)
+        # Ask Gemini for the ID/mark pairs
+        pairs = await extract_pairs_from_image(image_bytes)
 
-        # --- Safety Checks ---
-        # if not ids or not marks:
-        #     await update.message.reply_text("Could not find any valid numbers in the image.")
-        #     return "Could not find any valid numbers in the image."
-            
-        # # If the bot found an unequal amount of IDs and Marks, it shouldn't guess
-        # if len(ids) != len(marks):
-        #     await update.message.reply_text(f"Mismatch Error: I found {len(ids)} IDs but {len(marks)} marks. Please retake the photo.")
-        #     return f"Mismatch Error: I found {len(ids)} IDs but {len(marks)} marks. Please retake the photo."
-        
+        if not pairs:
+            await update.message.reply_text("Couldn't find any IDs in the image, please retake the photo.")
+            return
 
-        # await update.message.reply_text(f"Processing Complete:\n{feedback}")
+        data = ", ".join(f"{i} {m}" for i, m in pairs)
 
-        if marks:
-            data = "\n".join([f"{i} {m}" for i, m in zip(ids, marks)])
-        else:
-            data = ids
-            
-        # await update.message.reply_text(extracted_text)
         await update.message.reply_text(data)
         await update.message.reply_text("Please copy and paste the data then edit if required, then send it back to me.")
-        
-        # 3. Clean up and Reply
-        os.remove(image_path)
-        
+
     except Exception as e:
         await update.message.reply_text(f"An error occurred: {str(e)}")
 
