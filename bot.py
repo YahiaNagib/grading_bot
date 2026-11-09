@@ -513,7 +513,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = ", ".join(f"{i} {m}" for i, m in pairs)
 
         await update.message.reply_text(data)
-        await update.message.reply_text("Please copy and paste the data then edit if required, then send it back to me.")
+        mark_col = context.user_data.get('mark_col', 'Not Set')
+        spreadsheet_name = context.user_data.get('active_sheet_name', 'Not Set')
+        worksheet_name = context.user_data.get('active_worksheet') or 'sheet1 (Default)'
+
+        await update.message.reply_text(
+            "Please copy and paste the data then edit if required, then send it back "
+            f"to update column {mark_col} in spreadsheet {spreadsheet_name} in sheet {worksheet_name}."
+        )
 
     except Exception as e:
         await update.message.reply_text(f"An error occurred: {str(e)}")
