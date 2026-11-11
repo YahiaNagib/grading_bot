@@ -234,6 +234,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['active_worksheet'] = ws_name
         await query.edit_message_text(f"📑 Active worksheet set to: **{ws_name}**", parse_mode='Markdown')
 
+    elif data.startswith("overwrite:"):
+        pending = context.user_data.pop('pending_overwrite', None)
+        if not pending:
+            await query.edit_message_text("⚠️ This request has expired.")
+            return
+
+        conflicts = pending['conflicts']
+        if data == "overwrite:no":
+            await query.edit_message_text(f"👍 Kept existing values for {len(conflicts)} ID(s).")
+            return
+
+        try:
+            sheet = open_worksheet(pending['sheet_id'], pending['worksheet'])
+            cells = [gspread.Cell(c['row'], pending['mark_col'], c['new']) for c in conflicts]
+            sheet.update_cells(cells, value_input_option='USER_ENTERED')
+            lines = "\n".join(f"Overwrote ID {c['id']}: {c['old']} → {c['new']}" for c in conflicts)
+            await query.edit_message_text(f"✅ Done!\n{lines}")
+        except Exception as e:
+            await query.edit_message_text(f"❌ An error occurred while overwriting: {str(e)}")
+
     elif data == "prompt_id_col":
         context.user_data['state'] = 'AWAITING_ID_COL'
         await query.edit_message_text("🔢 Please send the **ID column number** (e.g., 2 for column B):", parse_mode='Markdown')
@@ -454,40 +474,62 @@ async def extract_pairs_from_image(image_bytes, mime_type="image/jpeg"):
 
     return pairs
 
+def open_worksheet(sheet_id, worksheet_name=None):
+    """Open the given worksheet (or the first one) of a spreadsheet."""
+    spreadsheet = client.open_by_key(sheet_id)
+    if worksheet_name:
+        return spreadsheet.worksheet(worksheet_name)
+    return spreadsheet.sheet1
+
 def parse_and_update(text, sheet_id, id_column, mark_column, worksheet_name=None):
-    """Extract IDs/Marks regardless of layout and update the sheet."""
+    """Extract IDs/Marks and write them into empty mark cells only.
+
+    Returns (error, results, conflicts). conflicts lists rows whose mark cell
+    already holds a different value, so the user can decide whether to overwrite.
+    """
 
     try:
-        spreadsheet = client.open_by_key(sheet_id)
-        if worksheet_name:
-            sheet = spreadsheet.worksheet(worksheet_name)
-        else:
-            sheet = spreadsheet.sheet1
+        sheet = open_worksheet(sheet_id, worksheet_name)
     except Exception as e:
-        return f"Error connecting to sheet: {str(e)}. Make sure you shared it with the bot's email!"
+        return f"Error connecting to sheet: {str(e)}. Make sure you shared it with the bot's email!", [], []
 
     ids, marks = extract_ids_and_marks(text)
 
     results = []
-    # Fetch all current IDs from the sheet to find the right row to update
+    conflicts = []
+    cells_to_write = []
+
+    # Fetch current IDs and marks once (col_values drops trailing empty cells)
     existing_ids = sheet.col_values(id_column)
+    existing_marks = sheet.col_values(mark_column)
 
     # Pair the categorized lists back together sequentially
     for i in range(len(ids)):
         student_id = ids[i]
-        
-        mark = 1 if not marks else marks[i]
-        
+
+        mark = "1" if not marks else str(marks[i])
+
         try:
             # +1 because spreadsheet index starts at 1
-            row_index = existing_ids.index(student_id) + 1 
-            # Write the mark into the mark column for that specific row
-            sheet.update_cell(row_index, mark_column, mark) 
-            results.append(f"Updated ID {student_id} with mark {mark}")
+            row_index = existing_ids.index(student_id) + 1
         except ValueError:
             results.append(f"ID {student_id} not found in spreadsheet.")
-            
-    return "\n".join(results)
+            continue
+
+        current = existing_marks[row_index - 1].strip() if row_index <= len(existing_marks) else ""
+
+        if not current:
+            cells_to_write.append(gspread.Cell(row_index, mark_column, mark))
+            results.append(f"Updated ID {student_id} with mark {mark}")
+        elif current == mark:
+            results.append(f"ID {student_id} already has mark {mark}")
+        else:
+            conflicts.append({'row': row_index, 'id': student_id, 'old': current, 'new': mark})
+
+    if cells_to_write:
+        sheet.update_cells(cells_to_write, value_input_option='USER_ENTERED')
+
+    return None, results, conflicts
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
@@ -602,15 +644,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         # Pass the multiline text directly to your existing parser
-        feedback = parse_and_update(user_text, sheet_id, id_col, mark_col, worksheet_name=active_ws)
-        
-        # Send the final results back to the user
+        error, results, conflicts = parse_and_update(user_text, sheet_id, id_col, mark_col, worksheet_name=active_ws)
 
-        if "error" in feedback.lower():
-            await update.message.reply_text(f"❌ An error occurred: {feedback}")
-        else:
-            await update.message.reply_text(f"✅ Done!\n{feedback}")
-        
+        if error:
+            await update.message.reply_text(f"❌ An error occurred: {error}")
+            return
+
+        if results:
+            await update.message.reply_text("✅ Done!\n" + "\n".join(results))
+
+        if conflicts:
+            # Remember the pending overwrite (replaces any older one)
+            context.user_data['pending_overwrite'] = {
+                'sheet_id': sheet_id,
+                'worksheet': active_ws,
+                'mark_col': mark_col,
+                'conflicts': conflicts,
+            }
+            lines = "\n".join(f"ID {c['id']}: current {c['old']} → new {c['new']}" for c in conflicts)
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("Overwrite all", callback_data="overwrite:yes"),
+                InlineKeyboardButton("Keep existing", callback_data="overwrite:no"),
+            ]])
+            await update.message.reply_text(
+                f"⚠️ These cells already have a value and were not changed:\n{lines}\n\n"
+                "Do you want to overwrite them?",
+                reply_markup=keyboard,
+            )
+
     except Exception as e:
         await update.message.reply_text(f"❌ An error occurred: {str(e)}")
 
